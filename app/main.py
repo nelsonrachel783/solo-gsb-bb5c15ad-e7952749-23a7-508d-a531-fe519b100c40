@@ -48,6 +48,16 @@ availability PATCH appends one only when the enabled state really flips;
 same-value retries, dry runs and failed batches create no version.  A legacy
 bank gets one version-1 baseline per item at first startup (idempotently).
 
+Selection pins the served item's current revision version to the session:
+repeated ``/next`` calls return the stem and options exactly as delivered,
+and the eventual answer is validated and scored against that version's
+options, correct answer and IRT parameters -- a formal import changing the
+item between selection and answer can no longer re-grade the old answer
+against the new content.  When a withdrawn pending item is cleared and
+re-selected, the replacement is pinned to its own current version; a stored
+``response_id`` replay still returns the first result, and the answer-time
+``content_tag`` freeze keeps following the live bank tag.
+
 ``POST /api/sessions/{id}/review-plan`` turns a finished session's wrong
 answers (the ``score = 0`` frozen at answer time) into a spaced-repetition
 review plan: stem, options and the correct answer are frozen into the plan at
@@ -137,6 +147,10 @@ app = FastAPI(
         "单题预测概率校准对比作答前保存的 p_correct 与实际得分；"
         "题库修订历史在正式导入新增/内容变化、启用状态实际变化时"
         "于同一写事务内追加完整快照版本（旧库首启建立基线，幂等不重复）；"
+        "取题时在会话中持久关联当次送达的题目版本：重复 /next 始终返回当次"
+        "送达的题干与选项，提交答案按该版本的选项、正确答案与 IRT 参数"
+        "校验计分，取题后正式导入改题不会把旧题答案按新版本误判；"
+        "挂起题撤回后的重选关联新版本，已保存 response_id 重放仍返回首次结果；"
         "作答提交时冻结该题当时的 content_tag：进度、/next 配额缺口与末段"
         "欠额限制、精度停测配额门槛均按冻结标签统计，之后导入改标签或"
         "撤回已答题不追溯改写已答归属、不误判配额已满足或提前结束"
@@ -148,7 +162,7 @@ app = FastAPI(
         "题目或评分不同返回 409 且不改动结果与日程，冲突检查先于到期判断；"
         "仅接受已到期题，同一写事务记录结果并推进日程）。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -246,7 +260,8 @@ def expire_if_due(
     conn.execute(
         """UPDATE sessions
            SET status = 'finished', finish_reason = 'time_expired',
-               current_item_id = NULL, updated_at = ?
+               current_item_id = NULL, current_item_version = NULL,
+               updated_at = ?
            WHERE id = ? AND status = 'active'""",
         (now.isoformat(timespec="seconds"), session["id"]),
     )
@@ -333,6 +348,72 @@ def serialize_item(row: sqlite3.Row, *, reveal: bool = False) -> ItemOut:
         stem=row["stem"],
         options=parse_options(row["options"]),
     )
+
+
+def serialize_revision_item(row: sqlite3.Row) -> ItemOut:
+    """Served-item view of a pinned ``item_revisions`` snapshot.
+
+    The correct answer and exposure count stay hidden, exactly like
+    :func:`serialize_item`; ``item_revisions`` rows use the same content
+    column names as ``items`` rows but key the id as ``item_id``.
+    """
+    return ItemOut(
+        id=row["item_id"],
+        difficulty=row["difficulty"],
+        discrimination=row["discrimination"],
+        content_tag=row["content_tag"],
+        stem=row["stem"],
+        options=parse_options(row["options"]),
+    )
+
+
+def pinned_revision(
+    conn: sqlite3.Connection, item_id: str, version: int | None
+) -> sqlite3.Row | None:
+    """Fetch the immutable revision snapshot pinned when an item was served.
+
+    Returns ``None`` -- and callers fall back to the live ``items`` row --
+    when no version was pinned (a pending item served before the
+    version-pinning migration) or, defensively, when the snapshot row is
+    missing.  Revision rows are append-only, so the pinned snapshot never
+    changes for the lifetime of the session.
+    """
+    if version is None:
+        return None
+    return conn.execute(
+        "SELECT * FROM item_revisions WHERE item_id = ? AND version = ?",
+        (item_id, version),
+    ).fetchone()
+
+
+def latest_item_version(conn: sqlite3.Connection, item_id: str) -> int | None:
+    """Newest revision version of an item (``None`` when it has no history)."""
+    return conn.execute(
+        "SELECT MAX(version) AS v FROM item_revisions WHERE item_id = ?",
+        (item_id,),
+    ).fetchone()["v"]
+
+
+def served_current_item(
+    conn: sqlite3.Connection, session: sqlite3.Row
+) -> ItemOut | None:
+    """Pending item as it was delivered: the pinned version snapshot.
+
+    Used by read-only progress views so they show the same stem/options as
+    the examinee received even after a formal import rewrites the bank row.
+    A legacy pending item (no pinned version) falls back to the live row.
+    """
+    item_id = session["current_item_id"]
+    if not item_id:
+        return None
+    revision = pinned_revision(conn, item_id, session["current_item_version"])
+    if revision is not None:
+        return serialize_revision_item(revision)
+    item_row = conn.execute(
+        "SELECT * FROM items WHERE id = ?", (item_id,)
+    ).fetchone()
+    return serialize_item(item_row) if item_row is not None else None
+
 
 
 def serialize_bank_item(row: sqlite3.Row) -> BankItemOut:
@@ -1186,13 +1267,10 @@ def session_progress(
             (session_id,),
         ).fetchall()
     ]
-    current_item = None
-    if session["current_item_id"]:
-        item_row = conn.execute(
-            "SELECT * FROM items WHERE id = ?", (session["current_item_id"],)
-        ).fetchone()
-        if item_row is not None:
-            current_item = serialize_item(item_row)
+    # The pending item is shown from the revision version pinned when it was
+    # served, so a later import cannot make progress display content the
+    # examinee never saw.
+    current_item = served_current_item(conn, session)
     bank_size = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
     minimums = tag_minimums_for(conn, session_id)
     answered_tags = answered_by_tag(conn, session_id)
@@ -1440,11 +1518,20 @@ def next_item(
     current theta; ties break on the smallest item id, so the result is
     fully deterministic.
 
+    A new selection pins the item's **current revision version**
+    (``current_item_version``) to the session in the same transaction that
+    counts the exposure.  While the item stays pending, every repeated
+    /next call returns the stem, options and information of exactly that
+    delivered snapshot, even if a formal import rewrites the bank row in
+    the meantime; the answer is later scored against the same snapshot
+    (see :func:`submit_response`).
+
     A pending item that was withdrawn after being served is cleared inside
-    this same transaction and a replacement is selected by the normal
-    rules; the exposure counted when it was originally selected is not
-    rolled back.  (If no eligible replacement exists the session finishes
-    with the usual ``no_available_items`` /
+    this same transaction -- together with its pinned version -- and a
+    replacement is selected by the normal rules, pinned to the
+    replacement's current version; the exposure counted when it was
+    originally selected is not rolled back.  (If no eligible replacement
+    exists the session finishes with the usual ``no_available_items`` /
     ``tag_minimums_unfulfillable`` reason.)
 
     When the session carries ``tag_minimums``, the per-tag deficit is
@@ -1512,6 +1599,7 @@ def next_item(
         # fall through to the normal selection rules below.  The exposure
         # counted when the item was selected is NOT rolled back.
         pending_row: sqlite3.Row | None = None
+        pending_revision: sqlite3.Row | None = None
         withdrawn_pending: str | None = None
         if session["current_item_id"]:
             candidate_pending = conn.execute(
@@ -1519,27 +1607,43 @@ def next_item(
             ).fetchone()
             if candidate_pending is not None and candidate_pending["is_active"]:
                 pending_row = candidate_pending
+                # The revision version pinned when the item was served:
+                # repeated /next calls and the eventual answer keep using
+                # this immutable snapshot even if a formal import rewrites
+                # the bank row in the meantime.
+                pending_revision = pinned_revision(
+                    conn,
+                    session["current_item_id"],
+                    session["current_item_version"],
+                )
             else:
                 # Withdrawn (or, defensively, no longer existing) pending
                 # item: drop the marker and re-select below.
                 withdrawn_pending = session["current_item_id"]
                 conn.execute(
                     """UPDATE sessions
-                       SET current_item_id = NULL, updated_at = ?
+                       SET current_item_id = NULL, current_item_version = NULL,
+                           updated_at = ?
                        WHERE id = ?""",
                     (now, session_id),
                 )
 
         # Case 1: a served, unanswered (and still enabled) item is pending
-        # -> return it as-is.
+        # -> return it as delivered (the pinned version snapshot, when one
+        # was recorded), without counting another exposure.
         if pending_row is not None:
+            served = (
+                pending_revision if pending_revision is not None else pending_row
+            )
             outcome = {
                 "status": session["status"],
                 "item_row": pending_row,
+                "item_revision": pending_revision,
+                "item_version": session["current_item_version"],
                 "information": irt.information(
                     session["theta"],
-                    pending_row["discrimination"],
-                    pending_row["difficulty"],
+                    served["discrimination"],
+                    served["difficulty"],
                 ),
                 "exposure_limit": session["exposure_limit"],
                 "answered_count": n_answered,
@@ -1556,6 +1660,8 @@ def next_item(
             outcome = {
                 "status": "finished",
                 "item_row": None,
+                "item_revision": None,
+                "item_version": None,
                 "information": None,
                 "exposure_limit": session["exposure_limit"],
                 "answered_count": n_answered,
@@ -1579,6 +1685,8 @@ def next_item(
             outcome = {
                 "status": "finished",
                 "item_row": None,
+                "item_revision": None,
+                "item_version": None,
                 "information": None,
                 "exposure_limit": session["exposure_limit"],
                 "answered_count": n_answered,
@@ -1653,6 +1761,8 @@ def next_item(
                 outcome = {
                     "status": "finished",
                     "item_row": None,
+                    "item_revision": None,
+                    "item_version": None,
                     "information": None,
                     "exposure_limit": session["exposure_limit"],
                     "answered_count": n_answered,
@@ -1699,6 +1809,8 @@ def next_item(
                     outcome = {
                         "status": "finished",
                         "item_row": None,
+                        "item_revision": None,
+                        "item_version": None,
                         "information": None,
                         "exposure_limit": session["exposure_limit"],
                         "answered_count": n_answered,
@@ -1733,15 +1845,25 @@ def next_item(
                         winner = scan.global_winner
                         assert winner is not None
                         info, best_id = winner
+                    # Pin the item's current revision version to the session
+                    # in the same transaction that counts the exposure and
+                    # marks the item pending: repeated /next calls and the
+                    # eventual answer are served and scored from this
+                    # immutable snapshot, so a formal import changing the
+                    # item before it is answered cannot re-grade the answer
+                    # against the new content.
+                    best_version = latest_item_version(conn, best_id)
                     conn.execute(
                         "UPDATE items SET exposure_count = exposure_count + 1 "
                         "WHERE id = ?",
                         (best_id,),
                     )
                     conn.execute(
-                        "UPDATE sessions SET current_item_id = ?, updated_at = ? "
+                        "UPDATE sessions "
+                        "SET current_item_id = ?, current_item_version = ?, "
+                        "    updated_at = ? "
                         "WHERE id = ?",
-                        (best_id, now, session_id),
+                        (best_id, best_version, now, session_id),
                     )
                     item_row = conn.execute(
                         "SELECT * FROM items WHERE id = ?", (best_id,)
@@ -1749,6 +1871,10 @@ def next_item(
                     outcome = {
                         "status": "active",
                         "item_row": item_row,
+                        "item_revision": pinned_revision(
+                            conn, best_id, best_version
+                        ),
+                        "item_version": best_version,
                         "information": info,
                         "exposure_limit": session["exposure_limit"],
                         "answered_count": n_answered,
@@ -1775,10 +1901,20 @@ def next_item(
         )
 
     item_row = outcome["item_row"]
+    item_revision = outcome["item_revision"]
+    if item_revision is not None:
+        # Serve the pinned version snapshot: stem/options/information stay
+        # exactly as delivered even if the bank row has since been rewritten.
+        served_item = serialize_revision_item(item_revision)
+    elif item_row is not None:
+        served_item = serialize_item(item_row)
+    else:
+        served_item = None
     return NextItemOut(
         session_id=session_id,
         status=outcome["status"],
-        item=serialize_item(item_row) if item_row is not None else None,
+        item=served_item,
+        item_version=outcome["item_version"],
         information=outcome["information"],
         exposure_count=item_row["exposure_count"] if item_row is not None else None,
         exposure_limit=outcome["exposure_limit"],
@@ -1826,6 +1962,17 @@ def submit_response(
     item (``is_active = 0``) is likewise rejected with 409 — no response
     row is written and theta is not updated — while a replayed
     ``response_id`` still returns the first stored result.
+
+    Validation and scoring use the revision version **pinned when the item
+    was served**: the submitted key is checked against that version's
+    options, the score against its correct answer, and the Newton update
+    uses its difficulty/discrimination — so a formal import changing the
+    item between selection and answer cannot re-grade the answer against
+    the new content, and the stored row (``correct_answer``, ``score``,
+    ``p_correct``, ``theta_after``) stays consistent with the ability
+    update.  The frozen ``content_tag`` still follows the bank tag current
+    at answer time, and a legacy pending item without a pinned version
+    falls back to the live bank row.
 
     After the theta update the optional precision stop is evaluated in the
     same transaction: when the session has a ``target_se``, the summed 2PL
@@ -1906,18 +2053,30 @@ def submit_response(
                     ),
                 )
 
-            option_keys = {opt["key"] for opt in parse_options(item["options"])}
+            # Validate and score against the revision version pinned when
+            # the item was served: a formal import that changed the item
+            # after selection cannot re-grade this answer against the new
+            # content.  A legacy pending item (no pinned version) falls back
+            # to the live bank row, matching the pre-migration behaviour.
+            scoring = pinned_revision(
+                conn, body.item_id, session["current_item_version"]
+            )
+            if scoring is None:
+                scoring = item
+
+            option_keys = {opt["key"] for opt in parse_options(scoring["options"])}
             if response_key not in option_keys:
                 raise HTTPException(
                     status_code=422,
                     detail=f"无效作答选项：{body.response!r}，可选 {sorted(option_keys)}",
                 )
 
-            # 4) Score and apply exactly one Newton-Raphson update.
-            score = 1 if response_key == item["answer"] else 0
+            # 4) Score and apply exactly one Newton-Raphson update, using the
+            #    served version's answer and IRT parameters.
+            score = 1 if response_key == scoring["answer"] else 0
             theta_before = session["theta"]
             theta_after, p_correct, _, info = irt.newton_step(
-                theta_before, item["discrimination"], item["difficulty"], score
+                theta_before, scoring["discrimination"], scoring["difficulty"], score
             )
             now = utc_now()
             exposure_at_select = item["exposure_count"]
@@ -1943,7 +2102,7 @@ def submit_response(
                         body.item_id,
                         response_key,
                         score,
-                        item["answer"],
+                        scoring["answer"],
                         theta_before,
                         theta_after,
                         p_correct,
@@ -1974,7 +2133,8 @@ def submit_response(
                 #    when the optional precision stop rule is satisfied.
                 conn.execute(
                     """UPDATE sessions
-                       SET theta = ?, current_item_id = NULL, updated_at = ?
+                       SET theta = ?, current_item_id = NULL,
+                           current_item_version = NULL, updated_at = ?
                        WHERE id = ?""",
                     (theta_after, now, session_id),
                 )

@@ -19,6 +19,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     id               TEXT PRIMARY KEY,
     theta            REAL NOT NULL,
     current_item_id  TEXT REFERENCES items(id), -- item currently served, not yet answered
+    -- Item revision version pinned when the pending item was served.  Repeated
+    -- /next calls return the stem/options of THIS immutable snapshot and the
+    -- eventual answer is validated and scored against its options, correct
+    -- answer and IRT parameters, so a formal import changing the item between
+    -- selection and answer cannot re-grade the old answer against new content.
+    -- NULL for pending items served before this column existed (legacy
+    -- databases): those fall back to the live bank content, as before.
+    current_item_version INTEGER,
     max_items        INTEGER NOT NULL,
     exposure_limit   INTEGER NOT NULL,
     duration_seconds INTEGER, -- optional time limit in seconds (60..86400); NULL = no limit
@@ -250,7 +258,8 @@ def _migrate_response_content_tags(conn: sqlite3.Connection) -> None:
 # Columns copied verbatim when rebuilding the sessions table for the pause
 # migration; kept in sync with the canonical CREATE TABLE above.
 _SESSION_COLUMNS = (
-    "id, theta, current_item_id, max_items, exposure_limit, duration_seconds, "
+    "id, theta, current_item_id, current_item_version, max_items, "
+    "exposure_limit, duration_seconds, "
     "expires_at, target_se, min_precision_items, paused_at, remaining_seconds, "
     "status, finish_reason, created_at, updated_at"
 )
@@ -329,6 +338,10 @@ def init_db() -> None:
             _ensure_column(conn, "sessions", "expires_at", "TEXT")
             _ensure_column(conn, "sessions", "target_se", "REAL")
             _ensure_column(conn, "sessions", "min_precision_items", "INTEGER")
+            # Served-version pinning: a legacy sessions table acquires the
+            # pinned revision column (NULL = pending items served before the
+            # upgrade, which keep the old live-content behaviour).
+            _ensure_column(conn, "sessions", "current_item_version", "INTEGER")
 
         # Item withdrawal: a legacy item bank acquires the is_active column
         # with DEFAULT 1, i.e. every existing item migrates to "enabled".

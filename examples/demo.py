@@ -31,6 +31,14 @@ deficit/endgame restriction and the precision-stop quota gate all count
 those frozen tags: retagging an answered item by import (or withdrawing
 it) afterwards neither moves the answer between tags, nor makes a quota
 look already met, nor ends the session early.
+
+The served-version section shows that selecting an item pins its current
+revision version to the session: a formal import changing the item between
+selection and answer leaves repeated /next calls returning the delivered
+stem/options, the answer is scored against the delivered version's answer
+and IRT parameters, a fresh selection serves the newest version, and a
+re-selection after the pending item was withdrawn is pinned to the
+replacement's current version.
 """
 
 from __future__ import annotations
@@ -199,6 +207,7 @@ def main() -> None:
     demo_withdrawal()
     demo_frozen_tags()
     demo_revisions()
+    demo_served_version()
 
 
 def demo_pause_resume() -> None:
@@ -962,6 +971,137 @@ def demo_revisions() -> None:
         "GET", f"/api/items/{iid}/revisions/9999")
     assert status_code == 404, body
     print("  -> 未知题目与未知版本均返回 404 ✔")
+
+
+def demo_served_version() -> None:
+    """Show served-version pinning: a mid-flight import cannot re-grade an answer."""
+    print("\n--- 送达题目版本固定：取题后正式导入改题，不影响挂起题的送达内容与判分 ---")
+
+    # 两道专用演示题。DEMO-VP-1 区分度 5.0：theta=0 的新会话必然最先选中它
+    # （演示题库 a<=1.8，此前演示段落留下的启用题 a<=2.0）；DEMO-VP-2 取
+    # a=2.6，使 VP-1 改难（b=0.5）后信息量仍略高于 VP-2、撤回 VP-1 后 VP-2
+    # 必然被重选，全程结果确定。导入为幂等 upsert，重复运行只会追加版本。
+    def vp1(stem: str, answer: str, difficulty: float) -> dict:
+        return {
+            "id": "DEMO-VP-1", "difficulty": difficulty, "discrimination": 5.0,
+            "content_tag": "版本演示", "stem": stem,
+            "options": [{"key": "A", "text": "2"}, {"key": "B", "text": "3"}],
+            "answer": answer,
+        }
+
+    def vp2(stem: str) -> dict:
+        return {
+            "id": "DEMO-VP-2", "difficulty": 0.0, "discrimination": 2.6,
+            "content_tag": "版本演示", "stem": stem,
+            "options": [{"key": "A", "text": "2"}, {"key": "B", "text": "3"}],
+            "answer": "A",
+        }
+
+    imported = call(
+        "POST", "/api/items/import",
+        {"items": [vp1("版本演示题 第一版：1 + 1 = ?", "A", 0.0),
+                   vp2("兜底演示题 第一版：1 + 1 = ?")]},
+    )
+    assert imported["valid"] is True
+    # 重复运行时上一轮可能把演示题留在撤回状态：先统一启用。
+    for iid in ("DEMO-VP-1", "DEMO-VP-2"):
+        enabled = call("PATCH", f"/api/items/{iid}/availability",
+                       {"is_active": True})
+        assert enabled["is_active"] is True
+
+    # --- 取题后、作答前正式导入改题：重复 /next 仍返回当次送达的题干与选项 ---
+    s1 = call("POST", "/api/sessions",
+              {"max_items": 5, "exposure_limit": 10_000})
+    s1id = s1["id"]
+    n1 = call("POST", f"/api/sessions/{s1id}/next")
+    assert n1["item"]["id"] == "DEMO-VP-1"
+    assert "第一版" in n1["item"]["stem"]
+    served_version = n1["item_version"]
+    served_info = n1["information"]
+    print(f"  -> 取到 DEMO-VP-1（第一版），关联版本 item_version={served_version}")
+
+    # 正式导入改动同一题：题干、正确答案（A->B）与难度（0->0.5）全部变化。
+    updated = call(
+        "POST", "/api/items/import",
+        {"items": [vp1("版本演示题 第二版：1 + 1 = ?", "B", 0.5)]},
+    )
+    assert updated["valid"] is True and updated["updated_count"] == 1
+    bank_now = call("GET", "/api/items/DEMO-VP-1")
+    assert bank_now["answer"] == "B" and "第二版" in bank_now["stem"]
+    print("  -> 正式导入已把题库中的 DEMO-VP-1 改成第二版（答案 B、难度 0.5）")
+
+    n2 = call("POST", f"/api/sessions/{s1id}/next")
+    assert n2["item"]["id"] == "DEMO-VP-1"
+    assert "第一版" in n2["item"]["stem"], "重复 /next 必须返回当次送达的题干"
+    assert n2["item_version"] == served_version, "挂起题仍关联取题时的版本"
+    assert n2["information"] == served_info, "信息量按送达版本的 IRT 参数计算"
+    assert n2["exposure_count"] == n1["exposure_count"], "重复取题不重复计曝光"
+    progress = call("GET", f"/api/sessions/{s1id}/progress")
+    assert "第一版" in progress["current_item"]["stem"], \
+        "进度中的挂起题同样按送达版本展示"
+    print("  -> 重复 /next 与进度仍返回第一版题干/选项，item_version 不变 ✔")
+
+    # --- 提交答案按送达版本判分：v1 答案 A 判对；若误按 v2（答案 B）则判错 ---
+    result = call(
+        "POST", f"/api/sessions/{s1id}/responses",
+        {"response_id": f"demo-vp-{s1id[:8]}-1",
+         "item_id": "DEMO-VP-1", "response": "A"},
+    )
+    assert result["correct"] is True and result["correct_answer"] == "A", \
+        "必须按送达版本（第一版，答案 A）判分，而不是导入后的新版本（答案 B）"
+    # 送达版本参数 a=5, b=0：theta 0 --答对--> 0.4；
+    # 若误用新版本的 b=0.5，theta 会跳到约 2.64。
+    assert abs(result["theta_after"] - 0.4) < 1e-9, \
+        "能力更新必须使用送达版本的 IRT 参数"
+    print("  -> 按送达版本判分：第一版答案 A 判对，theta_after=0.4 与 v1 参数一致 ✔")
+
+    # 已保存 response_id 的重放仍返回首次结果。
+    replay = call(
+        "POST", f"/api/sessions/{s1id}/responses",
+        {"response_id": f"demo-vp-{s1id[:8]}-1",
+         "item_id": "DEMO-VP-1", "response": "A"},
+    )
+    assert replay["created_at"] == result["created_at"]
+    assert replay["theta_after"] == result["theta_after"]
+    print("  -> 已保存 response_id 重放仍返回首次结果 ✔")
+
+    # --- 新取题关联当前版本；挂起题撤回后的重选关联新版本 ---
+    s2 = call("POST", "/api/sessions",
+              {"max_items": 5, "exposure_limit": 10_000})
+    s2id = s2["id"]
+    first = call("POST", f"/api/sessions/{s2id}/next")
+    assert first["item"]["id"] == "DEMO-VP-1"
+    assert "第二版" in first["item"]["stem"], "新选题应送达当前最新版本的内容"
+    latest_version = call("GET", "/api/items/DEMO-VP-1/revisions")["count"]
+    assert first["item_version"] == latest_version
+    print(f"  -> 新会话取题送达当前版本（第二版），item_version={latest_version} ✔")
+
+    # 先把兜底题也导入出新版本，再撤回挂起的 DEMO-VP-1：/next 同事务清除
+    # 挂起项并重选，重选题必须关联其当前（新）版本。
+    call("POST", "/api/items/import",
+         {"items": [vp2("兜底演示题 第二版：1 + 1 = ?")]})
+    call("PATCH", "/api/items/DEMO-VP-1/availability", {"is_active": False})
+    reselected = call("POST", f"/api/sessions/{s2id}/next")
+    assert reselected["item"]["id"] == "DEMO-VP-2"
+    assert "第二版" in reselected["item"]["stem"], \
+        "撤回重选的题必须关联其当前最新版本"
+    assert "DEMO-VP-1" in (reselected["note"] or "")
+    vp2_latest = call("GET", "/api/items/DEMO-VP-2/revisions")["count"]
+    assert reselected["item_version"] == vp2_latest
+    print("  -> 挂起题撤回后重选 DEMO-VP-2，关联其当前版本（第二版题干）✔")
+
+    # 重选题可正常按送达版本作答。
+    answered = call(
+        "POST", f"/api/sessions/{s2id}/responses",
+        {"response_id": f"demo-vp-{s2id[:8]}-1",
+         "item_id": "DEMO-VP-2", "response": "A"},
+    )
+    assert answered["correct"] is True
+
+    # 收尾：把演示题留在撤回状态，保证重复运行本脚本时其他演示段落不受影响。
+    for iid in ("DEMO-VP-1", "DEMO-VP-2"):
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    print("  -> 演示题已撤回，不影响后续演示与重复运行 ✔")
 
 
 if __name__ == "__main__":

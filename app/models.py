@@ -469,6 +469,15 @@ class NextItemOut(BaseModel):
     session_id: str
     status: str
     item: ItemOut | None = None
+    item_version: int | None = Field(
+        None,
+        description=(
+            "本次送达题目关联的题库修订版本号：取题时在会话中持久固定，"
+            "重复 /next 返回该版本的题干与选项，提交作答按该版本的选项、"
+            "正确答案与 IRT 参数校验计分；无挂起题（或旧库迁移前已挂起的题）"
+            "时为 null"
+        ),
+    )
     information: float | None = None
     exposure_count: int | None = None
     exposure_limit: int
