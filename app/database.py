@@ -19,6 +19,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     id               TEXT PRIMARY KEY,
     theta            REAL NOT NULL,
     current_item_id  TEXT REFERENCES items(id), -- item currently served, not yet answered
+    -- Revision version of the pending item as it was served.  /next
+    -- re-serves and /responses scores against this frozen snapshot
+    -- (item_revisions), so a formal import changing the item before it is
+    -- answered cannot re-judge the delivered content.  NULL when no item
+    -- is pending and on sessions predating this column (they fall back to
+    -- the live bank content).
+    current_item_version INTEGER,
     max_items        INTEGER NOT NULL,
     exposure_limit   INTEGER NOT NULL,
     duration_seconds INTEGER, -- optional time limit in seconds (60..86400); NULL = no limit
@@ -250,7 +257,8 @@ def _migrate_response_content_tags(conn: sqlite3.Connection) -> None:
 # Columns copied verbatim when rebuilding the sessions table for the pause
 # migration; kept in sync with the canonical CREATE TABLE above.
 _SESSION_COLUMNS = (
-    "id, theta, current_item_id, max_items, exposure_limit, duration_seconds, "
+    "id, theta, current_item_id, current_item_version, max_items, "
+    "exposure_limit, duration_seconds, "
     "expires_at, target_se, min_precision_items, paused_at, remaining_seconds, "
     "status, finish_reason, created_at, updated_at"
 )
@@ -329,6 +337,10 @@ def init_db() -> None:
             _ensure_column(conn, "sessions", "expires_at", "TEXT")
             _ensure_column(conn, "sessions", "target_se", "REAL")
             _ensure_column(conn, "sessions", "min_precision_items", "INTEGER")
+            # Served-version freeze: legacy sessions acquire the column with
+            # NULL (they keep the old live-content behaviour for a pending
+            # item); newly served items always record the delivered version.
+            _ensure_column(conn, "sessions", "current_item_version", "INTEGER")
 
         # Item withdrawal: a legacy item bank acquires the is_active column
         # with DEFAULT 1, i.e. every existing item migrates to "enabled".

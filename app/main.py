@@ -48,6 +48,17 @@ availability PATCH appends one only when the enabled state really flips;
 same-value retries, dry runs and failed batches create no version.  A legacy
 bank gets one version-1 baseline per item at first startup (idempotently).
 
+The revision served to a session is frozen on the session row at selection
+time (``sessions.current_item_version``): repeated /next calls return the
+delivered stem/options even after a formal import changes the item, and the
+answer is validated and scored -- option keys, correct answer and the 2PL
+IRT parameters of the Newton update -- against that frozen version, so an
+in-flight import can never re-judge an answer by content the examinee never
+saw.  A pending item withdrawn and re-selected binds the replacement's
+current version, and a stored ``response_id`` replay still returns the first
+result.  The answer-time ``content_tag`` freeze is unchanged: it keeps
+reading the bank tag as it is when the answer is submitted.
+
 ``POST /api/sessions/{id}/review-plan`` turns a finished session's wrong
 answers (the ``score = 0`` frozen at answer time) into a spaced-repetition
 review plan: stem, options and the correct answer are frozen into the plan at
@@ -137,6 +148,10 @@ app = FastAPI(
         "单题预测概率校准对比作答前保存的 p_correct 与实际得分；"
         "题库修订历史在正式导入新增/内容变化、启用状态实际变化时"
         "于同一写事务内追加完整快照版本（旧库首启建立基线，幂等不重复）；"
+        "取题时在会话中冻结当次送达的题目版本：重复 /next 始终返回送达时的"
+        "题干与选项，提交答案按该冻结版本的选项、正确答案与 IRT 参数校验计分"
+        "（取题后正式导入改题不影响在途作答；挂起题撤回重选改关联新题的当前版本；"
+        "已存 response_id 重放仍返回首次结果），"
         "作答提交时冻结该题当时的 content_tag：进度、/next 配额缺口与末段"
         "欠额限制、精度停测配额门槛均按冻结标签统计，之后导入改标签或"
         "撤回已答题不追溯改写已答归属、不误判配额已满足或提前结束"
@@ -148,7 +163,7 @@ app = FastAPI(
         "题目或评分不同返回 409 且不改动结果与日程，冲突检查先于到期判断；"
         "仅接受已到期题，同一写事务记录结果并推进日程）。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -246,7 +261,8 @@ def expire_if_due(
     conn.execute(
         """UPDATE sessions
            SET status = 'finished', finish_reason = 'time_expired',
-               current_item_id = NULL, updated_at = ?
+               current_item_id = NULL, current_item_version = NULL,
+               updated_at = ?
            WHERE id = ? AND status = 'active'""",
         (now.isoformat(timespec="seconds"), session["id"]),
     )
@@ -324,14 +340,53 @@ def parse_options(raw: str) -> list[dict]:
     return json.loads(raw)
 
 
-def serialize_item(row: sqlite3.Row, *, reveal: bool = False) -> ItemOut:
+def latest_item_version(conn: sqlite3.Connection, item_id: str) -> int | None:
+    """Current (maximum) revision version of an item; ``None`` when it has no
+    recorded history (defensive -- every bank item gets at least a baseline
+    or ``import_create`` version, so selections always freeze a version)."""
+    row = conn.execute(
+        "SELECT MAX(version) AS v FROM item_revisions WHERE item_id = ?",
+        (item_id,),
+    ).fetchone()
+    return row["v"] if row is not None else None
+
+
+def served_item_content(
+    conn: sqlite3.Connection,
+    item_row: sqlite3.Row | None,
+    version: int | None,
+) -> sqlite3.Row | None:
+    """The item content the examinee was actually served.
+
+    ``item_row`` is the live ``items`` row and ``version`` the revision
+    frozen on the session at selection time.  Returns the matching
+    ``item_revisions`` snapshot -- it exposes the same content column names
+    as ``items`` (stem/options/answer/difficulty/discrimination/
+    content_tag) -- falling back to the live row when no version was frozen
+    (sessions predating the column) or the snapshot is missing (defensive).
+    """
+    if item_row is None or version is None:
+        return item_row
+    revision = conn.execute(
+        "SELECT * FROM item_revisions WHERE item_id = ? AND version = ?",
+        (item_row["id"], version),
+    ).fetchone()
+    return revision if revision is not None else item_row
+
+
+def serialize_served_item(
+    item_row: sqlite3.Row, content_row: sqlite3.Row
+) -> ItemOut:
+    """ItemOut for a pending item: identity from the live ``items`` row,
+    content from the revision frozen when it was served (or the live row
+    itself when nothing was frozen)."""
     return ItemOut(
-        id=row["id"],
-        difficulty=row["difficulty"],
-        discrimination=row["discrimination"],
-        content_tag=row["content_tag"],
-        stem=row["stem"],
-        options=parse_options(row["options"]),
+        id=item_row["id"],
+        difficulty=content_row["difficulty"],
+        discrimination=content_row["discrimination"],
+        content_tag=content_row["content_tag"],
+        stem=content_row["stem"],
+        options=parse_options(content_row["options"]),
     )
 
 
@@ -1192,7 +1247,14 @@ def session_progress(
             "SELECT * FROM items WHERE id = ?", (session["current_item_id"],)
         ).fetchone()
         if item_row is not None:
-            current_item = serialize_item(item_row)
+            # Show the revision frozen when the item was served, matching
+            # what /next re-serves and /responses scores against.
+            current_item = serialize_served_item(
+                item_row,
+                served_item_content(
+                    conn, item_row, session["current_item_version"]
+                ),
+            )
     bank_size = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
     minimums = tag_minimums_for(conn, session_id)
     answered_tags = answered_by_tag(conn, session_id)
@@ -1443,9 +1505,18 @@ def next_item(
     A pending item that was withdrawn after being served is cleared inside
     this same transaction and a replacement is selected by the normal
     rules; the exposure counted when it was originally selected is not
-    rolled back.  (If no eligible replacement exists the session finishes
+    rolled back, and the replacement is bound to its own current revision
+    version.  (If no eligible replacement exists the session finishes
     with the usual ``no_available_items`` /
     ``tag_minimums_unfulfillable`` reason.)
+
+    A pending item that is still enabled is re-served exactly as it was
+    delivered: the stem, options and IRT parameters come from the revision
+    version frozen on the session at selection time
+    (``sessions.current_item_version``), so a formal import that changed
+    the item after it was served cannot swap the content the examinee is
+    about to answer.  Sessions predating the frozen-version column fall
+    back to the live bank content.
 
     When the session carries ``tag_minimums``, the per-tag deficit is
     computed from the content tags **frozen on each stored response at
@@ -1525,21 +1596,29 @@ def next_item(
                 withdrawn_pending = session["current_item_id"]
                 conn.execute(
                     """UPDATE sessions
-                       SET current_item_id = NULL, updated_at = ?
+                       SET current_item_id = NULL, current_item_version = NULL,
+                           updated_at = ?
                        WHERE id = ?""",
                     (now, session_id),
                 )
 
         # Case 1: a served, unanswered (and still enabled) item is pending
-        # -> return it as-is.
+        # -> return it as it was delivered: the content comes from the
+        # revision version frozen at selection time, so an in-flight formal
+        # import cannot swap the stem/options/IRT parameters the examinee
+        # is answering.  No new exposure is counted.
         if pending_row is not None:
+            content_row = served_item_content(
+                conn, pending_row, session["current_item_version"]
+            )
             outcome = {
                 "status": session["status"],
                 "item_row": pending_row,
+                "content_row": content_row,
                 "information": irt.information(
                     session["theta"],
-                    pending_row["discrimination"],
-                    pending_row["difficulty"],
+                    content_row["discrimination"],
+                    content_row["difficulty"],
                 ),
                 "exposure_limit": session["exposure_limit"],
                 "answered_count": n_answered,
@@ -1556,6 +1635,7 @@ def next_item(
             outcome = {
                 "status": "finished",
                 "item_row": None,
+                "content_row": None,
                 "information": None,
                 "exposure_limit": session["exposure_limit"],
                 "answered_count": n_answered,
@@ -1579,6 +1659,7 @@ def next_item(
             outcome = {
                 "status": "finished",
                 "item_row": None,
+                "content_row": None,
                 "information": None,
                 "exposure_limit": session["exposure_limit"],
                 "answered_count": n_answered,
@@ -1653,6 +1734,7 @@ def next_item(
                 outcome = {
                     "status": "finished",
                     "item_row": None,
+                    "content_row": None,
                     "information": None,
                     "exposure_limit": session["exposure_limit"],
                     "answered_count": n_answered,
@@ -1699,6 +1781,7 @@ def next_item(
                     outcome = {
                         "status": "finished",
                         "item_row": None,
+                        "content_row": None,
                         "information": None,
                         "exposure_limit": session["exposure_limit"],
                         "answered_count": n_answered,
@@ -1733,15 +1816,26 @@ def next_item(
                         winner = scan.global_winner
                         assert winner is not None
                         info, best_id = winner
+                    # Freeze the revision version being served on the session:
+                    # repeated /next calls re-serve and the eventual answer is
+                    # judged against this snapshot, even if a formal import
+                    # changes the item before it is answered.  (The latest
+                    # revision always mirrors the live bank content at this
+                    # instant; a re-selection after a withdrawn pending item
+                    # takes this same path and binds the replacement's
+                    # current version.)
+                    served_version = latest_item_version(conn, best_id)
                     conn.execute(
                         "UPDATE items SET exposure_count = exposure_count + 1 "
                         "WHERE id = ?",
                         (best_id,),
                     )
                     conn.execute(
-                        "UPDATE sessions SET current_item_id = ?, updated_at = ? "
+                        "UPDATE sessions "
+                        "SET current_item_id = ?, current_item_version = ?, "
+                        "    updated_at = ? "
                         "WHERE id = ?",
-                        (best_id, now, session_id),
+                        (best_id, served_version, now, session_id),
                     )
                     item_row = conn.execute(
                         "SELECT * FROM items WHERE id = ?", (best_id,)
@@ -1749,6 +1843,7 @@ def next_item(
                     outcome = {
                         "status": "active",
                         "item_row": item_row,
+                        "content_row": item_row,
                         "information": info,
                         "exposure_limit": session["exposure_limit"],
                         "answered_count": n_answered,
@@ -1775,10 +1870,19 @@ def next_item(
         )
 
     item_row = outcome["item_row"]
+    content_row = (
+        outcome["content_row"]
+        if outcome["content_row"] is not None
+        else item_row
+    )
     return NextItemOut(
         session_id=session_id,
         status=outcome["status"],
-        item=serialize_item(item_row) if item_row is not None else None,
+        item=(
+            serialize_served_item(item_row, content_row)
+            if item_row is not None
+            else None
+        ),
         information=outcome["information"],
         exposure_count=item_row["exposure_count"] if item_row is not None else None,
         exposure_limit=outcome["exposure_limit"],
@@ -1826,6 +1930,18 @@ def submit_response(
     item (``is_active = 0``) is likewise rejected with 409 — no response
     row is written and theta is not updated — while a replayed
     ``response_id`` still returns the first stored result.
+
+    The answer is judged against the revision version frozen on the session
+    when the item was served (``sessions.current_item_version``): the
+    submitted option key is validated against that version's options, the
+    score compares it with that version's correct answer, and the Newton
+    update plus the stored ``p_correct``/``information_at_theta`` use that
+    version's 2PL parameters — so a formal import changing the item after
+    it was served can never re-judge the answer by content the examinee
+    never saw, and the stored result stays consistent with the ability
+    update.  (Sessions predating the frozen-version column fall back to the
+    live bank content.)  The frozen ``content_tag`` is still the bank tag
+    as it is at answer time, exactly as before.
 
     After the theta update the optional precision stop is evaluated in the
     same transaction: when the session has a ``target_se``, the summed 2PL
@@ -1906,7 +2022,16 @@ def submit_response(
                     ),
                 )
 
-            option_keys = {opt["key"] for opt in parse_options(item["options"])}
+            # Judge the answer against the revision frozen when the item
+            # was served: options, correct answer and IRT parameters all
+            # come from that snapshot, so an in-flight formal import cannot
+            # re-judge the answer by content the examinee never saw.  A
+            # legacy session without a frozen version falls back to the
+            # live row (the pre-freeze behaviour).
+            served = served_item_content(
+                conn, item, session["current_item_version"]
+            )
+            option_keys = {opt["key"] for opt in parse_options(served["options"])}
             if response_key not in option_keys:
                 raise HTTPException(
                     status_code=422,
@@ -1914,17 +2039,20 @@ def submit_response(
                 )
 
             # 4) Score and apply exactly one Newton-Raphson update.
-            score = 1 if response_key == item["answer"] else 0
+            score = 1 if response_key == served["answer"] else 0
             theta_before = session["theta"]
             theta_after, p_correct, _, info = irt.newton_step(
-                theta_before, item["discrimination"], item["difficulty"], score
+                theta_before, served["discrimination"], served["difficulty"], score
             )
             now = utc_now()
             exposure_at_select = item["exposure_count"]
             # Freeze the item's content tag at answer time.  Every later
             # quota statistic (progress, /next endgame restriction,
             # precision-stop gate) reads this copy, so retagging the bank
-            # item afterwards cannot move this answer between tags.
+            # item afterwards cannot move this answer between tags.  This
+            # deliberately keeps reading the LIVE bank tag at answer time
+            # (unchanged behaviour), independent of the served-version
+            # snapshot used for scoring above.
             frozen_tag = item["content_tag"] or None
 
             try:
@@ -1943,7 +2071,7 @@ def submit_response(
                         body.item_id,
                         response_key,
                         score,
-                        item["answer"],
+                        served["answer"],
                         theta_before,
                         theta_after,
                         p_correct,
@@ -1974,7 +2102,8 @@ def submit_response(
                 #    when the optional precision stop rule is satisfied.
                 conn.execute(
                     """UPDATE sessions
-                       SET theta = ?, current_item_id = NULL, updated_at = ?
+                       SET theta = ?, current_item_id = NULL,
+                           current_item_version = NULL, updated_at = ?
                        WHERE id = ?""",
                     (theta_after, now, session_id),
                 )

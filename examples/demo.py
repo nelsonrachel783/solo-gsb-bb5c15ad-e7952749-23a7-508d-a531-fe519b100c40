@@ -31,6 +31,14 @@ deficit/endgame restriction and the precision-stop quota gate all count
 those frozen tags: retagging an answered item by import (or withdrawing
 it) afterwards neither moves the answer between tags, nor makes a quota
 look already met, nor ends the session early.
+
+The served-version section shows that the revision served to a session is
+frozen on the session at selection time: a formal import changing the
+pending item afterwards neither swaps the stem/options returned by repeated
+/next calls nor re-judges the answer by the new content (options, correct
+answer and IRT parameters all come from the frozen version), a fresh
+session is served the new version, and a re-selection after the pending
+item is withdrawn binds the replacement's current version.
 """
 
 from __future__ import annotations
@@ -198,6 +206,7 @@ def main() -> None:
     demo_pause_resume()
     demo_withdrawal()
     demo_frozen_tags()
+    demo_served_version()
     demo_revisions()
 
 
@@ -839,6 +848,177 @@ def demo_frozen_tags() -> None:
     print("  -> 精度停测的配额门槛按冻结标签：改标 FZC-1 不会让第 2 题后"
           "配额看似满足（旧逻辑会在此误判提前停测），真正的第二道"
           "「冻结乙」FZC-3 作答后才 precision_reached ✔")
+
+
+def demo_served_version() -> None:
+    """Show the served revision is frozen on the session at selection time.
+
+    A formal import that changes the *pending* item afterwards must not
+    re-judge the in-flight answer by the new content: repeated /next calls
+    keep returning the delivered stem/options, and the answer is validated
+    and scored (options, correct answer, IRT parameters) against the frozen
+    version.  A fresh session is served the new version, and the
+    re-selection after a pending-item withdrawal binds the replacement's
+    current version.
+    """
+    print("\n--- 取题版本冻结：取题后导入改题，在途作答仍按送达版本判分 ---")
+
+    # 两道专用演示题：DEMO-SV-1（a=5.0）与 DEMO-SV-2（a=4.0）在 theta=0 的
+    # 新会话里信息量（6.25 / 4.0）远高于演示题库与其余演示遗留题（<=1.0），
+    # 选题结果确定；重复运行只更新内容，曝光数与启用状态由导入保留。
+    sv1_v1 = {
+        "id": "DEMO-SV-1", "difficulty": 0.0, "discrimination": 5.0,
+        "content_tag": "版本演示", "stem": "版本演示题 v1：1 + 1 = ?",
+        "options": [{"key": "A", "text": "2"}, {"key": "B", "text": "3"}],
+        "answer": "A",
+    }
+    sv1_v2 = {
+        "id": "DEMO-SV-1", "difficulty": 0.2, "discrimination": 5.0,
+        "content_tag": "版本演示", "stem": "版本演示题 v2：2 + 2 = ?",
+        "options": [{"key": "A", "text": "3"}, {"key": "B", "text": "4"}],
+        "answer": "B",
+    }
+    sv2_v1 = {
+        "id": "DEMO-SV-2", "difficulty": 0.0, "discrimination": 4.0,
+        "content_tag": "版本演示", "stem": "版本演示题 DEMO-SV-2：3 + 3 = ?",
+        "options": [{"key": "A", "text": "5"}, {"key": "B", "text": "6"}],
+        "answer": "B",
+    }
+    sv2_v2 = {
+        "id": "DEMO-SV-2", "difficulty": 0.3, "discrimination": 4.0,
+        "content_tag": "版本演示", "stem": "版本演示题 DEMO-SV-2 v2：4 + 4 = ?",
+        "options": [{"key": "A", "text": "8"}, {"key": "B", "text": "7"}],
+        "answer": "A",
+    }
+    imported = call(
+        "POST", "/api/items/import", {"items": [sv1_v1, sv2_v1]},
+    )
+    assert imported["valid"] is True
+    # 重复运行时上一轮把演示题留在了撤回状态：先统一启用。
+    for iid in ("DEMO-SV-1", "DEMO-SV-2"):
+        assert call("PATCH", f"/api/items/{iid}/availability",
+                    {"is_active": True})["is_active"] is True
+
+    # --- 取题后正式导入改题：/next 仍返回送达版本，作答按送达版本判分 ---
+    s1 = call("POST", "/api/sessions",
+              {"max_items": 3, "exposure_limit": 10_000})
+    s1id = s1["id"]
+    chosen = call("POST", f"/api/sessions/{s1id}/next")
+    assert chosen["item"]["id"] == "DEMO-SV-1"
+    assert chosen["item"]["stem"] == sv1_v1["stem"]
+    assert chosen["item"]["options"] == sv1_v1["options"]
+    exposure_at_select = chosen["exposure_count"]
+    print(f"  -> 取到 DEMO-SV-1（v1：答案 A，曝光 {exposure_at_select}），暂不作答")
+
+    # 正式导入把 DEMO-SV-1 改成 v2：题干/选项/答案/难度全部变化。
+    call("POST", "/api/items/import", {"items": [sv1_v2]})
+    bank_now = call("GET", "/api/items/DEMO-SV-1")
+    assert bank_now["stem"] == sv1_v2["stem"] and bank_now["answer"] == "B"
+    print("  -> 正式导入把 DEMO-SV-1 改为 v2（题库当前答案已变为 B）✔")
+
+    # 重复 /next 仍返回送达时的 v1 题干/选项，不重复计曝光，信息量按 v1 参数。
+    again = call("POST", f"/api/sessions/{s1id}/next")
+    assert again["item"]["stem"] == sv1_v1["stem"]
+    assert again["item"]["options"] == sv1_v1["options"]
+    assert again["exposure_count"] == exposure_at_select
+    assert abs(again["information"] - 6.25) < 1e-9  # v1: a=5.0, b=0.0
+    progress = call("GET", f"/api/sessions/{s1id}/progress")
+    assert progress["current_item"]["stem"] == sv1_v1["stem"]
+    show("题库已更新为 v2，重复 /next 仍返回送达的 v1 内容", {
+        "题库当前题干": bank_now["stem"],
+        "重复 /next 返回题干": again["item"]["stem"],
+        "重复 /next 返回选项": again["item"]["options"],
+        "曝光不变": again["exposure_count"] == exposure_at_select,
+    })
+    print("  -> 重复 /next 与进度查询均返回送达版本，不重复计曝光 ✔")
+
+    # 按 v1 作答「A」（v1 正确答案）：必须按送达版本判对——若误按题库当前
+    # v2 判分，A 会被判错（v2 答案为 B），且 θ 会按 v2 参数更新。
+    result = call(
+        "POST", f"/api/sessions/{s1id}/responses",
+        {"response_id": f"demo-sv-{s1id[:8]}-1",
+         "item_id": "DEMO-SV-1", "response": "A"},
+    )
+    assert result["correct"] is True and result["score"] == 1
+    assert result["correct_answer"] == "A", "应按送达版本 v1 的答案判分"
+    assert abs(result["p_correct"] - 0.5) < 1e-9       # v1 参数 a=5,b=0
+    assert abs(result["theta_after"] - 0.4) < 1e-9     # 0 + 5*0.5/6.25
+    assert result["content_tag"] == "版本演示"
+    session_now = call("GET", f"/api/sessions/{s1id}")
+    assert abs(session_now["theta"] - result["theta_after"]) < 1e-12, \
+        "保存的作答结果须与能力更新一致"
+    history = call("GET", f"/api/sessions/{s1id}/responses")
+    assert history["results"][0]["correct_answer"] == "A"
+    assert history["results"][0]["score"] == 1
+    show("按送达版本判分（题库当前答案已是 B）", {
+        "提交": "A（v1 的正确答案）",
+        "correct": result["correct"],
+        "correct_answer": result["correct_answer"],
+        "p_correct": result["p_correct"],
+        "theta_after": round(result["theta_after"], 4),
+    })
+    print("  -> 按送达版本 v1 判对：correct_answer=A、θ 按 v1 参数更新，"
+          "记录与能力一致 ✔")
+
+    # 已保存 response_id 的重放仍返回首次结果（HTTP 200）。
+    status, replay = call_status(
+        "POST", f"/api/sessions/{s1id}/responses",
+        {"response_id": f"demo-sv-{s1id[:8]}-1",
+         "item_id": "DEMO-SV-1", "response": "A"},
+    )
+    assert status == 200
+    assert replay["created_at"] == result["created_at"]
+    assert replay["theta_after"] == result["theta_after"]
+    print("  -> 已存 response_id 重放仍返回首次结果（200）✔")
+
+    # --- 新取题使用新版本：另一会话取到 v2 并按 v2 判分 ---
+    s2 = call("POST", "/api/sessions",
+              {"max_items": 3, "exposure_limit": 10_000})
+    s2id = s2["id"]
+    chosen2 = call("POST", f"/api/sessions/{s2id}/next")
+    assert chosen2["item"]["id"] == "DEMO-SV-1"
+    assert chosen2["item"]["stem"] == sv1_v2["stem"]
+    assert chosen2["item"]["options"] == sv1_v2["options"]
+    result2 = call(
+        "POST", f"/api/sessions/{s2id}/responses",
+        {"response_id": f"demo-sv-{s2id[:8]}-1",
+         "item_id": "DEMO-SV-1", "response": "B"},
+    )
+    assert result2["correct"] is True and result2["correct_answer"] == "B"
+    print("  -> 新会话取到 v2 内容并按 v2 判分（答案 B 判对）✔")
+
+    # --- 挂起题撤回后的重选改关联新题的当前版本 ---
+    s3 = call("POST", "/api/sessions",
+              {"max_items": 3, "exposure_limit": 10_000})
+    s3id = s3["id"]
+    chosen3 = call("POST", f"/api/sessions/{s3id}/next")
+    assert chosen3["item"]["id"] == "DEMO-SV-1"  # v2 信息量仍高于 DEMO-SV-2
+    call("PATCH", "/api/items/DEMO-SV-1/availability", {"is_active": False})
+    reselected = call("POST", f"/api/sessions/{s3id}/next")
+    assert reselected["item"]["id"] == "DEMO-SV-2"
+    assert "DEMO-SV-1" in (reselected["note"] or "")
+    assert reselected["item"]["stem"] == sv2_v1["stem"]
+    print("  -> 挂起题撤回后重选出 DEMO-SV-2（送达其当前版本）✔")
+
+    # 重选后再改 DEMO-SV-2：/next 仍返回重选时送达的内容，作答按该版本判分。
+    call("POST", "/api/items/import", {"items": [sv2_v2]})
+    again3 = call("POST", f"/api/sessions/{s3id}/next")
+    assert again3["item"]["stem"] == sv2_v1["stem"]
+    assert again3["item"]["options"] == sv2_v1["options"]
+    result3 = call(
+        "POST", f"/api/sessions/{s3id}/responses",
+        {"response_id": f"demo-sv-{s3id[:8]}-1",
+         "item_id": "DEMO-SV-2", "response": "B"},
+    )
+    assert result3["correct"] is True and result3["correct_answer"] == "B"
+    assert abs(result3["theta_after"] - 0.5) < 1e-9  # 冻结版本 a=4,b=0
+    print("  -> 撤回重选关联送达版本：改题后 /next 仍返回原内容，"
+          "按原版本判分 ✔")
+
+    # 收尾：撤回演示题，保证重复运行本脚本时其他演示段落不受影响。
+    for iid in ("DEMO-SV-1", "DEMO-SV-2"):
+        call("PATCH", f"/api/items/{iid}/availability", {"is_active": False})
+    print("  -> 演示题已撤回，不影响后续演示 ✔")
 
 
 def demo_revisions() -> None:
